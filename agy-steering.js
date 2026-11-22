@@ -115,7 +115,8 @@ function attachSteering(input, output, child, stop) {
   toClient.on('error', stop);
   input.pipe(toAgent).pipe(child.stdin);
   child.stdout.pipe(toClient).pipe(output, { end: false });
-  return () => input.unpipe(toAgent);
+  // `relay` ends once everything agy wrote has been handed to `output`.
+  return { detach: () => input.unpipe(toAgent), relay: toClient };
 }
 
 module.exports = { attachSteering };

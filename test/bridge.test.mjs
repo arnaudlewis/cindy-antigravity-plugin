@@ -1075,4 +1075,87 @@ describe('Antigravity steering relay', () => {
     source.end();
     child.stdout.end();
   });
+
+  /**
+   * agy writes `notifications` notifications of about 1 KiB and exits while Cindy reads nothing, so the
+   * relay still holds output when agy's exit reaches it. Resolves with the bridge once agy is gone and the
+   * relay has had time to notice, or with null after skipping the test where the pipes are too small for
+   * agy to exit unread.
+   */
+  const agyExitsBeforeCindyReads = async (t, notifications) => {
+    const fixture = makeFixture(t);
+    fs.writeFileSync(path.join(fixture.dir, 'fake-agy.js'), `'use strict';
+require('node:fs').writeFileSync(process.env.FAKE_AGY_PIDFILE, String(process.pid));
+const padding = 'x'.repeat(1000);
+for (let n = 0; n < ${notifications}; n++) {
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { n, padding } }) + '\\n');
+}
+process.stdout.write('', () => process.exit(0));
+`, 'utf8');
+    const bridge = startBridge(fixture.env);
+    t.after(() => bridge.child.kill());
+    bridge.child.stdout.pause();
+    await waitFor(() => readPid(fixture.pidFile) !== null, 8_000, 'fake agy to start');
+    const pid = readPid(fixture.pidFile);
+    const exited = await waitFor(() => !isAlive(pid), 3_000, 'fake agy to exit').then(() => true, () => false);
+    if (!exited) {
+      t.skip('the pipes are too small for agy to exit before Cindy reads, so the exit this test targets cannot happen here');
+      return null;
+    }
+    // Let the relay learn of the exit and start closing while Cindy still reads nothing.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return bridge;
+  };
+  const notificationsOf = (bridge) => bridge.stdout.text().split('\n').filter(Boolean);
+
+  /**
+   * The relay keeps agy's output in its own buffers while Cindy is slow to read. The entry used to exit
+   * once stdout had room again, which dropped whatever those buffers still held. 300 KiB is more than the
+   * pipe to Cindy takes and less than the relay can hold, so most of it is still in the relay when agy's
+   * exit reaches it.
+   */
+  test('hands Cindy every notification agy wrote before it exited, even if Cindy reads late', { timeout: 20_000 }, async (t) => {
+    const notifications = 300;
+    const bridge = await agyExitsBeforeCindyReads(t, notifications);
+    if (!bridge) return;
+    bridge.child.stdout.resume();
+    const { code } = await bridge.closed;
+    const lines = notificationsOf(bridge);
+    assert.equal(lines.length, notifications, `${lines.length} of ${notifications} notifications reached Cindy`);
+    assert.ok(lines.every((line, n) => JSON.parse(line).params.n === n), 'notifications arrive in order');
+    assert.equal(code, 0, `exit code (stderr: ${bridge.stderr.text()})`);
+  });
+
+  /**
+   * With a little output left, stdout keeps part of it queued below its high-water mark, and no 'drain' event
+   * follows. The entry used to wait for one anyway, so the exit took the whole flush timeout (FLUSH_TIMEOUT_MS
+   * in agy-acp.js) after Cindy had read everything. The exit must come right after Cindy reads; half the
+   * timeout is a wide margin, not a budget.
+   * How much the pipes take before stdout keeps a queue varies with the load, so the burst grows until the
+   * relay is still running when Cindy reads. The first such burst leaves only a little queued.
+   */
+  test('exits right after Cindy has read the last notification, not after the flush timeout', { timeout: 40_000 }, async (t) => {
+    const flushTimeoutMs = 2_000;
+    let bridge = null;
+    let notifications = 130;
+    for (; notifications <= 210; notifications += 20) {
+      const attempt = await agyExitsBeforeCindyReads(t, notifications);
+      if (!attempt) return;
+      if (attempt.child.exitCode === null) {
+        bridge = attempt;
+        break;
+      }
+    }
+    if (!bridge) {
+      t.skip("the pipes hold all of agy's output, so the relay has nothing left to flush when Cindy reads");
+      return;
+    }
+    const resumedAt = Date.now();
+    bridge.child.stdout.resume();
+    const { code } = await bridge.closed;
+    const exitMs = Date.now() - resumedAt;
+    assert.equal(notificationsOf(bridge).length, notifications, 'every notification reaches Cindy');
+    assert.equal(code, 0, `exit code (stderr: ${bridge.stderr.text()})`);
+    assert.ok(exitMs < flushTimeoutMs / 2, `the bridge took ${exitMs} ms to exit after Cindy read everything; the flush timeout is ${flushTimeoutMs} ms`);
+  });
 });
