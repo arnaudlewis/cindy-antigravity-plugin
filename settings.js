@@ -57,6 +57,7 @@
       accountTimedOut: '5 分钟内没有完成登录，请重试。',
       accountSignedOutNote: '已退出登录。',
       accountBusy: '上一个登录操作还没有结束，请稍候。',
+      accountStale: 'Antigravity 可执行文件已更改，请重新检查登录状态后再试。',
       accountUnsupported: '这个版本的 agy 不支持这个操作，请在终端里用 agy 完成。',
       accountWorkerFailed: '插件后台没有响应，请稍后重试。',
       accountStatusFailed: '没能检查登录状态，请点「重新检测」。',
@@ -121,6 +122,7 @@
       accountTimedOut: 'Sign-in didn’t finish within 5 minutes. Try again.',
       accountSignedOutNote: 'Signed out.',
       accountBusy: 'The previous sign-in action hasn’t finished yet. Please wait.',
+      accountStale: 'The Antigravity executable changed. Check the sign-in again, then retry.',
       accountUnsupported: 'This version of agy can’t do that from here. Use agy in a terminal instead.',
       accountWorkerFailed: 'The plugin’s background process didn’t respond. Try again later.',
       accountStatusFailed: 'Couldn’t check the sign-in. Click “Check again”.',
@@ -359,7 +361,9 @@
     if (!error) return op === 'logout' ? { text: t.accountSignedOutNote, tone: 'neutral' } : null;
     if (error === 'cancelled') return { text: t.accountCancelled, tone: 'neutral' };
     if (error === 'timeout') return { text: t.accountTimedOut, tone: 'error' };
-    if (error === 'busy') return { text: t.accountBusy, tone: 'error' };
+    // A busy note only describes the moment of the refusal: it goes once the save has ended or a check has succeeded.
+    if (error === 'busy') return { text: t.accountBusy, tone: 'error', transient: true };
+    if (error === 'stale') return { text: t.accountStale, tone: 'error' };
     if (error === 'unsupported') return { text: t.accountUnsupported, tone: 'error' };
     if (error === 'not-installed') return null;
     if (op === 'login') return { text: t.loginFailed(message.detail), tone: 'error' };
@@ -375,11 +379,18 @@
     if (message) {
       if (message.account && typeof message.account === 'object') accountState = message.account;
       var note = accountNoteFor(state.op, message);
-      if (note || state.op !== 'status') accountNote = note;
+      if (note || state.op !== 'status' || (accountNote && accountNote.transient)) accountNote = note;
     } else {
       accountNote = { text: t[errorKey], tone: 'error' };
     }
     render();
+    // What the page shows belongs to a replaced executable (or to a main.js that restarted): read it again.
+    if (message && message.error === 'stale') requestDetect();
+  }
+
+  /** The executable generation the page's state describes (main.js counts path switches). */
+  function displayedGeneration() {
+    return snapshot && typeof snapshot.generation === 'number' ? snapshot.generation : undefined;
   }
 
   /** Same bounded resend-until-acknowledged handshake as detection. */
@@ -388,6 +399,8 @@
     var state = {
       reqId: 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
       op: op,
+      // The state the user acted on: kept for every resend, even if the page shows another one by then.
+      generation: displayedGeneration(),
       acked: false,
       sends: 0,
       resend: null,
@@ -410,7 +423,7 @@
         return;
       }
       state.sends += 1;
-      channel.postMessage({ type: 'account-request', reqId: state.reqId, op: op });
+      channel.postMessage({ type: 'account-request', reqId: state.reqId, op: op, generation: state.generation });
     };
     wake().then(function (wakeState) {
       if (accountRequests[state.reqId] !== state) return;
@@ -494,6 +507,8 @@
     customPathPending = null;
     clearInterval(state.resend);
     clearTimeout(state.deadline);
+    var droppedNote = Boolean(accountNote && accountNote.transient);
+    if (droppedNote) accountNote = null;
     if (message && message.ok && message.snapshot && typeof message.snapshot === 'object') {
       clearAccountRequests();
       snapshot = message.snapshot;
@@ -509,6 +524,7 @@
     var code = (message && message.error) || fallbackErrorKey || 'failed';
     customPathNote = { key: code, detail: message && message.detail, tone: 'error' };
     renderCustomPath();
+    if (droppedNote) renderAccount();
   }
 
   function requestCustomPath(rawPath) {
@@ -587,13 +603,18 @@
       if (data.type === 'custom-path-result') {
         if (customPathPending && data.reqId === customPathPending.reqId) {
           settleCustomPath(customPathPending, data);
-        } else if (!customPathPending && data.ok && data.snapshot && data.snapshot.result) {
+        } else if (data.ok && data.snapshot && data.snapshot.result) {
+          // Saved from another window: that is the current state, even while a save of our own waits for its answer.
           clearAccountRequests();
           snapshot = data.snapshot;
           error = data.snapshot.ok ? null : { key: 'detectFailed', text: data.snapshot.error };
           if (data.snapshot.account && typeof data.snapshot.account === 'object') accountState = data.snapshot.account;
-          customPathDirty = false;
+          if (!customPathPending) customPathDirty = false;
           render();
+        } else if (!customPathPending && accountNote && accountNote.transient) {
+          // A save started in another window ended without changing anything: the refusal it caused no longer applies.
+          accountNote = null;
+          renderAccount();
         }
         return;
       }

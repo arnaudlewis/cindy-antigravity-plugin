@@ -29,6 +29,8 @@
  *     keep-alives and `cli-progress` { op, events } notifications for the settings page.
  *   logout() -> { ok: true } | { ok: false, error, detail? }
  *     Signs agy out; the settings page only asks after the user confirmed.
+ *   login() and logout() answer { ok: false, error: 'busy' } while a custom path is being saved: the account
+ *   they would act on is the one of the executable being replaced.
  *   Sign-in stays with agy (see agy-account.js); the plugin never sees credentials or the email.
  */
 
@@ -116,6 +118,7 @@ const handlers = {
     }));
   },
   login() {
+    if (customPathPending > 0) return Promise.resolve({ ok: false, error: 'busy' });
     usageRead = undefined;
     if (activeLoginPromise) return Promise.resolve({ ok: false, error: 'busy' });
     const run = Promise.resolve(account.login(undefined, () => {
@@ -130,6 +133,7 @@ const handlers = {
     return account.cancelLogin();
   },
   async logout() {
+    if (customPathPending > 0) return { ok: false, error: 'busy' };
     usageRead = undefined;
     return account.logout();
   },

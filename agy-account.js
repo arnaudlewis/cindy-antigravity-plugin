@@ -21,6 +21,8 @@ const { probeFolder } = require('./agy-models.js');
 const GOOGLE_METHOD = 'oauth-personal';
 const LOGIN_TIMEOUT_MS = 5 * 60_000;
 const PROGRESS_INTERVAL_MS = 10_000;
+/** How long a cancelled sign-in's agy may take to exit before it is killed. */
+const CANCEL_KILL_GRACE_MS = 2_000;
 const MAX_DETAIL = 300;
 
 /** The sign-in in progress (at most one): { agy, child, cancelled }. */
@@ -28,6 +30,18 @@ let activeLogin = null;
 
 function detailOf(error) {
   return String((error && error.message) || error).slice(0, MAX_DETAIL);
+}
+
+/**
+ * Stops the agy of a cancelled sign-in. One that ignores SIGTERM (for example while stuck in `initialize`)
+ * is killed after a short grace, so the cancel always settles instead of waiting for the ACP timeout.
+ */
+function stopAgy(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  killTree(child);
+  const timer = setTimeout(() => killTree(child, 'SIGKILL'), CANCEL_KILL_GRACE_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  child.once('exit', () => clearTimeout(timer));
 }
 
 function canSignIn(init) {
@@ -93,7 +107,7 @@ async function login(options, onProgress) {
       ...(options && typeof options === 'object' ? options : null),
       onSpawn: (child) => {
         state.child = child;
-        if (state.cancelled) killTree(child);
+        if (state.cancelled) stopAgy(child);
       },
     });
     if (!state.agy) return { ok: false, error: 'not-installed' };
@@ -119,7 +133,7 @@ function cancelLogin() {
   if (!state) return { ok: true, cancelled: false };
   state.cancelled = true;
   const child = (state.agy && state.agy.child) || state.child;
-  if (child) killTree(child);
+  if (child) stopAgy(child);
   return { ok: true, cancelled: true };
 }
 

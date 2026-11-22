@@ -15,7 +15,9 @@
  *   main -> { type: 'custom-path-ack', reqId }
  *   main -> { type: 'custom-path-result', reqId, ok, snapshot?, error?, detail? }
  *   main -> { type: 'locale-changed' }
- *   page -> { type: 'account-request', reqId, op: 'status' | 'login' | 'cancel' | 'logout' }  (resent until acknowledged)
+ *   page -> { type: 'account-request', reqId, op: 'status' | 'login' | 'cancel' | 'logout', generation? }  (resent until acknowledged)
+ *     generation is the snapshot.generation the page showed when the user asked (it is clock-seeded, so it survives a main.js restart);
+ *     a login or logout asked for another one is answered with error 'stale'.
  *   main -> { type: 'account-ack', reqId }
  *   main -> { type: 'account-result', reqId, op, account, error?, detail? }
  *   main -> { type: 'account-changed', account }   (any change, e.g. a sign-in started from another view)
@@ -58,7 +60,8 @@
   var lastError = null;
   var lastCheckedAt = 0;
   var inflight = null;
-  var pathGeneration = 0;
+  // Counts path switches. Seeded from the clock so a restarted main.js never reuses a generation a page may still hold.
+  var pathGeneration = Date.now();
   var customPathQueue = Promise.resolve();
   var customPathPending = 0;
   var seenRequests = [];
@@ -329,6 +332,7 @@
       publish: lastPublish,
       error: lastError,
       checkedAt: lastCheckedAt,
+      generation: pathGeneration,
     };
   }
 
@@ -566,7 +570,8 @@
 
   /** agy's Google sign-in (agy opens the browser); then the models are read again. */
   function runLogin() {
-    if (accountOp) return Promise.resolve({ error: 'busy' });
+    // A path save is swapping the executable this request would reach: refuse until it has answered.
+    if (accountOp || customPathPending > 0) return Promise.resolve({ error: 'busy' });
     var gen = pathGeneration;
     var token = {};
     accountOp = 'login';
@@ -603,7 +608,8 @@
 
   /** Signs agy out; the settings page sends this only after the user confirmed. */
   function runLogout() {
-    if (accountOp) return Promise.resolve({ error: 'busy' });
+    // The account on screen belongs to the executable being replaced; never sign out the new one by mistake.
+    if (accountOp || customPathPending > 0) return Promise.resolve({ error: 'busy' });
     var gen = pathGeneration;
     var token = {};
     accountOp = 'logout';
@@ -823,7 +829,9 @@
       if (data.type === 'account-request' && Object.prototype.hasOwnProperty.call(ACCOUNT_OPS, data.op)) {
         channel.postMessage({ type: 'account-ack', reqId: data.reqId });
         if (!remember(data.reqId)) return;
-        ACCOUNT_OPS[data.op]().then(function (outcome) {
+        // The page asked about the account of an executable that has since been replaced: never act on the new one.
+        var stale = (data.op === 'login' || data.op === 'logout') && typeof data.generation === 'number' && data.generation !== pathGeneration;
+        (stale ? Promise.resolve({ error: 'stale' }) : ACCOUNT_OPS[data.op]()).then(function (outcome) {
           var message = { type: 'account-result', reqId: data.reqId, op: data.op, account: accountView() };
           if (outcome && outcome.error) message.error = outcome.error;
           if (outcome && outcome.detail) message.detail = outcome.detail;
