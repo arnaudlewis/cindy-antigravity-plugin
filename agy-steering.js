@@ -2,6 +2,7 @@
 
 const { Transform } = require('node:stream');
 const { StringDecoder } = require('node:string_decoder');
+const { completeInitializeResult, versionSupported } = require('./remote-workspace.js');
 
 function lineTransform(handle) {
   const decoder = new StringDecoder('utf8');
@@ -47,6 +48,18 @@ function supportsSteering(info) {
 }
 
 /**
+ * agy 1.5.13+ connects to HTTP MCP servers passed in session/new without declaring
+ * `agentCapabilities.mcpCapabilities.http`, so Cindy leaves them out. Declare it when it
+ * is omitted; an explicit boolean is the agent's own answer and stays.
+ */
+function completeHttpMcp(message) {
+  const result = message.result;
+  if (!versionSupported(result?.agentInfo?.version)) return message;
+  if (typeof result.agentCapabilities?.mcpCapabilities?.http === 'boolean') return message;
+  return { ...message, result: completeInitializeResult(result) };
+}
+
+/**
  * agy accepts concurrent session/prompt requests. The previous request may end
  * as soon as a new one takes over. Keep Cindy's original request open until
  * the newest prompt finishes and relay all of the session's streamed updates.
@@ -63,13 +76,15 @@ function attachSteering(input, output, child, stop) {
     if (!message || message.method || message.id === undefined) return line;
     if (message.id === initializeId) {
       initializeId = undefined;
-      if (supportsSteering(message.result?.agentInfo)) {
+      const completed = completeHttpMcp(message);
+      if (supportsSteering(completed.result?.agentInfo)) {
         offered = true;
-        const result = message.result;
-        return encode({ ...message, result: { ...result, _meta: {
+        const result = completed.result;
+        return encode({ ...completed, result: { ...result, _meta: {
           ...result._meta, steering: { ...result._meta?.steering, supported: true },
         } } });
       }
+      if (completed !== message) return encode(completed);
     }
 
     const turn = requests.get(message.id);

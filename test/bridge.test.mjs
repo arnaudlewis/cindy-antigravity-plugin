@@ -1076,3 +1076,97 @@ describe('Antigravity steering relay', () => {
     child.stdout.end();
   });
 });
+
+describe('Antigravity relay and the HTTP MCP capability', () => {
+  async function attach() {
+    const { PassThrough } = await import('node:stream');
+    const { default: steering } = await import('../agy-steering.js');
+    const source = new PassThrough();
+    const output = new PassThrough();
+    const child = { stdin: new PassThrough(), stdout: new PassThrough() };
+    const client = [];
+    output.on('data', (data) => client.push(data));
+    steering.attachSteering(source, output, child, (error) => { throw error; });
+    return { source, child, sent: () => Buffer.concat(client) };
+  }
+  // The answers are written as text so that a line parsed and written back shows up as different bytes.
+  const line = (result) => Buffer.from(`{"jsonrpc":"2.0","id":1,"result":${result}}\n`, 'utf8');
+  const info = (version) => `"agentInfo":{"name":"fake-agy","title":"假 AGY ✓","version":${JSON.stringify(version)}}`;
+  async function relay(...parts) {
+    const { source, child, sent } = await attach();
+    source.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}\n');
+    for (const part of parts) child.stdout.write(part);
+    await new Promise((resolve) => setImmediate(resolve));
+    source.end();
+    child.stdout.end();
+    return sent();
+  }
+
+  test('declares HTTP MCP support when agy 1.5.13 or later leaves it out', async () => {
+    // The agent is not a steering one here: the declaration does not depend on steering support.
+    for (const version of ['1.5.13', '1.5.14', '1.6.0', '2.0.1']) {
+      const reply = JSON.parse(await relay(line(
+        `{"protocolVersion":1,"agentCapabilities":{"loadSession":false,"mcpCapabilities":{"sse":true}},${info(version)},"authMethods":[]}`,
+      )));
+      assert.deepEqual(reply.result.agentCapabilities, { loadSession: false, mcpCapabilities: { sse: true, http: true } }, version);
+      assert.deepEqual(reply.result.agentInfo, { name: 'fake-agy', title: '假 AGY ✓', version }, version);
+      assert.equal(reply.result._meta, undefined, version);
+    }
+    const bare = JSON.parse(await relay(line(`{"protocolVersion":1,${info('1.5.13')}}`)));
+    assert.deepEqual(bare.result.agentCapabilities, { mcpCapabilities: { http: true } });
+  });
+
+  test('relays the response byte for byte when there is nothing to declare', async () => {
+    // An integer above 2^53 and `1.0` change when a line is parsed and written back.
+    const meta = ',"_meta":{"externalId":9007199254740993,"ratio":1.0}';
+    const untouched = {
+      'explicit http: true': `{"protocolVersion":1,"agentCapabilities":{"mcpCapabilities":{"http":true}},${info('1.5.13')}${meta}}`,
+      'explicit http: false': `{"protocolVersion":1,"agentCapabilities":{"mcpCapabilities":{"http":false,"sse":true}},${info('1.5.13')}${meta}}`,
+      'agy before 1.5.13': `{"protocolVersion":1,"agentCapabilities":{},${info('1.5.12')}${meta}}`,
+      'agy 1.4.99': `{"protocolVersion":1,"agentCapabilities":{},${info('1.4.99')}${meta}}`,
+      'no version': `{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"fake-agy"}${meta}}`,
+      'unreadable version': `{"protocolVersion":1,"agentCapabilities":{},${info('dev')}${meta}}`,
+    };
+    for (const [name, result] of Object.entries(untouched)) {
+      const expected = line(result);
+      assert.ok((await relay(expected)).equals(expected), name);
+    }
+    const failure = Buffer.from('{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"not ready","data":9007199254740993}}\n', 'utf8');
+    assert.ok((await relay(failure)).equals(failure), 'initialize error');
+  });
+
+  test('declares it together with steering support and leaves steering working', async () => {
+    const { source, child, sent } = await attach();
+    const write = (stream, message) => stream.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
+    const messages = () => sent().toString('utf8').trim().split('\n').map((text) => JSON.parse(text));
+    write(source, { id: 1, method: 'initialize', params: { protocolVersion: 1 } });
+    write(child.stdout, { id: 1, result: { agentInfo: { name: 'Antigravity ACP Server', version: '1.5.14' }, _meta: { retained: true } } });
+    const [reply] = messages();
+    assert.deepEqual(reply.result.agentCapabilities, { mcpCapabilities: { http: true } });
+    assert.deepEqual(reply.result._meta, { retained: true, steering: { supported: true } });
+    const prompt = [{ type: 'text', text: 'Switch focus' }];
+    write(source, { id: 2, method: 'session/prompt', params: { sessionId: 'one', prompt } });
+    write(source, { id: 3, method: '_session/steering', params: { sessionId: 'one', prompt } });
+    assert.equal(messages().at(-1).result.outcome, 'injected');
+    source.end();
+    child.stdout.end();
+  });
+
+  test('reassembles a response split inside a multi-byte character', async () => {
+    const bytes = line(`{"protocolVersion":1,${info('1.5.13')},"authMethods":[]}`);
+    const cut = bytes.indexOf(Buffer.from('✓', 'utf8')) + 1;
+    const reply = JSON.parse(await relay(bytes.subarray(0, cut), bytes.subarray(cut)));
+    assert.equal(reply.result.agentInfo.title, '假 AGY ✓');
+    assert.equal(reply.result.agentCapabilities.mcpCapabilities.http, true);
+  });
+
+  test('declares it on a response that arrives in many chunks', async () => {
+    const pad = 'A'.repeat(1.5 * 1024 * 1024);
+    const bytes = line(`{"protocolVersion":1,${info('1.5.13')},"pad":"${pad}"}`);
+    const parts = [];
+    for (let at = 0; at < bytes.length; at += 64 * 1024) parts.push(bytes.subarray(at, at + 64 * 1024));
+    const reply = JSON.parse(await relay(...parts));
+    assert.equal(reply.result.pad.length, pad.length);
+    assert.equal(reply.result.agentCapabilities.mcpCapabilities.http, true);
+  });
+});
